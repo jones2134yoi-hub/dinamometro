@@ -1,1 +1,189 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Medidor de Dinamômetro</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#101214;color:#eee;font-family:Arial,sans-serif;text-align:center}
+header{padding:14px 10px;background:#181b1f;font-size:22px;font-weight:bold}
+#wrap{max-width:900px;margin:auto;padding:10px}
+#cameraBox{position:relative;background:#000;border-radius:12px;overflow:hidden}
+video{display:block;width:100%;height:auto;min-height:240px;object-fit:cover}
+#target{position:absolute;left:50%;top:50%;width:70px;height:70px;transform:translate(-50%,-50%);border:2px solid #00ff88;border-radius:50%;pointer-events:none}
+#target:after{content:"";position:absolute;left:50%;top:-12px;height:94px;border-left:2px dashed #00ff88}
+.controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+label{display:block;background:#181b1f;padding:10px;border-radius:8px;text-align:left}
+input,button{width:100%;font-size:17px;padding:10px;border-radius:8px;border:0}
+button{background:#00a86b;color:white;font-weight:bold}
+button.secondary{background:#333}
+input{background:#292d32;color:white;margin-top:5px}
+.readings{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.card{background:#181b1f;border-radius:10px;padding:15px}
+.value{font-size:38px;font-weight:bold;color:#00ff88}
+.unit{color:#aaa}
+#status{margin-top:10px;padding:9px;border-radius:8px;background:#181b1f;color:#bbb}
+small{color:#999;display:block;margin-top:8px;line-height:1.4}
+</style>
+</head>
+<body>
+<header>📱 Medidor de Dinamômetro</header>
+<div id="wrap">
+  <div id="cameraBox">
+    <video id="video" autoplay muted playsinline></video>
+    <div id="target"></div>
+  </div>
 
+  <div class="controls">
+    <label>Diâmetro do rolo (cm)
+      <input id="diameter" type="number" value="30" min="1" step="0.1">
+    </label>
+    <label>Detecção
+      <button id="start">▶ Iniciar câmera</button>
+    </label>
+  </div>
+
+  <div class="controls">
+    <button id="reset" class="secondary">↺ Zerar leitura</button>
+    <button id="flip" class="secondary">🔄 Trocar câmera</button>
+  </div>
+
+  <div class="readings">
+    <div class="card">
+      <div>RPM</div>
+      <div id="rpm" class="value">0</div>
+      <div class="unit">rotações/min</div>
+    </div>
+    <div class="card">
+      <div>Velocidade</div>
+      <div id="speed" class="value">0.0</div>
+      <div class="unit">km/h</div>
+    </div>
+  </div>
+
+  <div id="status">Aponte a câmera para o rolo e coloque uma marca clara dentro do círculo verde.</div>
+  <small>
+    Para funcionar melhor, use uma única marca bem visível no rolo (ex.: fita branca em um rolo escuro).
+    A câmera deve ficar fixa. A velocidade calculada é a velocidade da superfície do rolo.
+  </small>
+</div>
+
+<canvas id="canvas" hidden></canvas>
+
+<script>
+const video=document.getElementById('video');
+const canvas=document.getElementById('canvas');
+const ctx=canvas.getContext('2d',{willReadFrequently:true});
+const rpmEl=document.getElementById('rpm');
+const speedEl=document.getElementById('speed');
+const statusEl=document.getElementById('status');
+const diameterEl=document.getElementById('diameter');
+
+let stream=null, facing='environment', running=false;
+let lastDetection=0, lastPeak=0, periods=[], brightnessHistory=[];
+let rpm=0;
+
+async function startCamera(){
+  try{
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:facing},width:{ideal:1280},height:{ideal:720}},
+      audio:false
+    });
+    video.srcObject=stream;
+    await video.play();
+    running=true;
+    statusEl.textContent='Câmera ativa. Coloque a marca do rolo no círculo verde.';
+    requestAnimationFrame(process);
+  }catch(e){
+    statusEl.textContent='Não foi possível abrir a câmera. Use HTTPS ou localhost e permita o acesso à câmera.';
+    console.error(e);
+  }
+}
+
+function process(){
+  if(!running || video.readyState<2){requestAnimationFrame(process);return;}
+  const size=120;
+  canvas.width=size; canvas.height=size;
+
+  // Captura uma pequena região no centro da imagem.
+  const vw=video.videoWidth, vh=video.videoHeight;
+  const side=Math.min(vw,vh)*0.18;
+  const sx=(vw-side)/2, sy=(vh-side)/2;
+  ctx.drawImage(video,sx,sy,side,side,0,0,size,size);
+
+  const data=ctx.getImageData(0,0,size,size).data;
+  let sum=0;
+  for(let i=0;i<data.length;i+=4){
+    sum += 0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2];
+  }
+  const avg=sum/(size*size);
+  const now=performance.now();
+
+  brightnessHistory.push({t:now,v:avg});
+  while(brightnessHistory.length && now-brightnessHistory[0].t>1500)
+    brightnessHistory.shift();
+
+  // Detecta um pico de luminosidade: a marca clara passando pelo centro.
+  if(brightnessHistory.length>3){
+    const recent=brightnessHistory.slice(-4).map(x=>x.v);
+    const localMax=recent[2]>recent[1] && recent[2]>=recent[3] && recent[2]>=recent[0];
+    const maxOld=Math.max(...brightnessHistory.map(x=>x.v));
+    const minOld=Math.min(...brightnessHistory.map(x=>x.v));
+    const threshold=minOld+(maxOld-minOld)*0.68;
+    const peakTime=brightnessHistory[brightnessHistory.length-2].t;
+
+    if(localMax && recent[2]>threshold && peakTime-lastPeak>100){
+      if(lastPeak>0){
+        const dt=peakTime-lastPeak;
+        // Aceita somente velocidades plausíveis para evitar falsos picos.
+        if(dt>40 && dt<10000){
+          periods.push(dt);
+          if(periods.length>6) periods.shift();
+          const median=[...periods].sort((a,b)=>a-b)[Math.floor(periods.length/2)];
+          rpm=60000/median;
+          updateSpeed();
+        }
+      }
+      lastPeak=peakTime;
+    }
+  }
+
+  // Se não houver passagem por algum tempo, zera suavemente.
+  if(lastPeak && now-lastPeak>1800){
+    rpm=0; periods=[];
+    updateSpeed();
+  }
+  requestAnimationFrame(process);
+}
+
+function updateSpeed(){
+  const d=parseFloat(diameterEl.value)||30;
+  const circumference=Math.PI*(d/100); // metros
+  const kmh=rpm*circumference*60/1000;
+  rpmEl.textContent=Math.round(rpm);
+  speedEl.textContent=kmh.toFixed(1);
+}
+
+document.getElementById('start').onclick=startCamera;
+
+document.getElementById('reset').onclick=()=>{
+  rpm=0; periods=[]; lastPeak=0; brightnessHistory=[];
+  rpmEl.textContent='0'; speedEl.textContent='0.0';
+  statusEl.textContent='Leitura zerada.';
+};
+
+document.getElementById('flip').onclick=()=>{
+  facing=(facing==='environment')?'user':'environment';
+  startCamera();
+};
+
+diameterEl.oninput=updateSpeed;
+
+if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+  statusEl.textContent='Seu navegador não disponibilizou acesso à câmera. Tente Chrome/Edge em HTTPS.';
+}
+</script>
+</body>
+  </html>
